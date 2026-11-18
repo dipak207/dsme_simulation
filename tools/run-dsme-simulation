@@ -1,0 +1,173 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+MODE=${1:-}
+case "$MODE" in
+  minimal) SCENARIO=dsme-minimal.csc; DURATION_US=120000000 ;;
+  fixed-mo5) SCENARIO=dsme-fixed-mo5.csc; DURATION_US=300000000 ;;
+  fixed-mo6) SCENARIO=dsme-fixed-mo6.csc; DURATION_US=300000000 ;;
+  adaptive) SCENARIO=dsme-adaptive-mo.csc; DURATION_US=300000000 ;;
+  *) echo "usage: $0 minimal|fixed-mo5|fixed-mo6|adaptive" >&2; exit 2 ;;
+esac
+RESULTS="$ROOT/simulation-results"
+mkdir -p "$RESULTS"
+STAMP="$(date -u +%Y%m%dT%H%M%S.%NZ)-$$"
+LOG="$RESULTS/${STAMP}-${MODE}.log"
+NATIVE_LOG="$RESULTS/${STAMP}-${MODE}-native-build.log"
+REPORT="$RESULTS/${STAMP}-${MODE}-validation.txt"
+CONFIG="$RESULTS/${STAMP}-external-tools.config"
+RUN_CONFIGURATION="$RESULTS/${STAMP}-${MODE}-configuration.txt"
+if [[ -e "$LOG" || -e "$NATIVE_LOG" || -e "$REPORT" || -e "$CONFIG" || -e "$RUN_CONFIGURATION" ]]; then
+  echo "refusing to overwrite run evidence for timestamp $STAMP" >&2
+  exit 1
+fi
+: > "$LOG"
+printf 'VALIDATION_PENDING mode=%s utc=%s\n' "$MODE" "$STAMP" > "$REPORT"
+cd "$ROOT"
+
+log() { printf '%s\n' "$*" | tee -a "$LOG"; }
+FAILED=0
+fail() {
+  local reason=$1
+  FAILED=1
+  log "SIMULATION_FAIL mode=$MODE reason=$reason log=$LOG validation=$REPORT"
+  printf 'VALIDATION_FAIL mode=%s reason=%s\n' "$MODE" "$reason" >> "$REPORT"
+  exit 1
+}
+on_exit() {
+  local status=$?
+  if ((status != 0 && FAILED == 0)); then
+    printf 'SIMULATION_FAIL mode=%s exit=%s log=%s validation=%s\n' "$MODE" "$status" "$LOG" "$REPORT" | tee -a "$LOG" >&2
+    printf 'VALIDATION_FAIL mode=%s exit=%s\n' "$MODE" "$status" >> "$REPORT"
+  fi
+}
+trap on_exit EXIT
+run() {
+  log "+ $*"
+  if "$@" 2>&1 | tee -a "$LOG"; then
+    return 0
+  else
+    local status=${PIPESTATUS[0]}
+    fail "command failed exit=$status command=$*"
+  fi
+}
+
+log "RUN_START mode=$MODE utc=$STAMP root=$ROOT"
+for tool in java javac ant gcc g++ make python3 nm readelf objcopy perl; do
+  command -v "$tool" >/dev/null 2>&1 || fail "missing required command: $tool"
+done
+if [[ -x /usr/lib/jvm/java-21-openjdk-amd64/bin/java && -x /usr/lib/jvm/java-21-openjdk-amd64/bin/javac ]]; then
+  export JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64
+  export PATH="$JAVA_HOME/bin:$PATH"
+fi
+JAVAC_REAL=$(readlink -f "$(command -v javac)")
+JAVA_REAL=$(readlink -f "$(command -v java)")
+JAVA_HOME=$(dirname "$(dirname "$JAVAC_REAL")")
+[[ "$(dirname "$(dirname "$JAVA_REAL")")" == "$JAVA_HOME" ]] || fail "java and javac resolve to different installations"
+export JAVA_HOME
+export PATH="$JAVA_HOME/bin:$PATH"
+JAVA_VERSION=$(java -version 2>&1 | head -n 1)
+JAVAC_VERSION=$(javac -version 2>&1)
+[[ "$JAVA_VERSION" == *"21."* && "$JAVAC_VERSION" == *"21."* ]] || fail "workflow requires the validated Java 21 toolchain; found $JAVA_VERSION / $JAVAC_VERSION"
+for jar in jaxb-api jaxb-runtime jaxb-core javax.activation rhino; do
+  [[ -r "/usr/share/java/$jar.jar" ]] || fail "missing runtime dependency /usr/share/java/$jar.jar"
+done
+[[ -r "$JAVA_HOME/include/jni.h" && -r "$JAVA_HOME/include/linux/jni_md.h" ]] || fail "JNI headers missing under JAVA_HOME=$JAVA_HOME"
+log "TOOLCHAIN java='$JAVA_VERSION' javac='$JAVAC_VERSION' JAVA_HOME=$JAVA_HOME ant='$(ant -version)' gcc=$(gcc -dumpfullversion) gxx=$(g++ -dumpfullversion) python='$(python3 --version)'"
+
+COOJA="$ROOT/tools/cooja"
+COOJA_BUILD="$COOJA/build-codespaces"
+[[ -r "$COOJA/build.xml" && -d "$COOJA/java" ]] || fail "Cooja source/build files are missing"
+for jar in jdom log4j jsyntaxpane; do
+  [[ -r "$COOJA/lib/$jar.jar" ]] || fail "missing Cooja dependency $COOJA/lib/$jar.jar"
+done
+SCENARIO_PATH="$ROOT/examples/ipv6/rpl-udp-dsme/$SCENARIO"
+[[ -r "$SCENARIO_PATH" ]] || fail "scenario not found: $SCENARIO_PATH"
+INITIAL_MO=5
+[[ "$MODE" == fixed-mo6 ]] && INITIAL_MO=6
+log "RUN_CONFIG mode=$MODE seed=123456 duration_us=$DURATION_US motes=3 initial_mo=$INITIAL_MO minimum_mo=5 maximum_mo=6 so=4 bo=7 cap_reduction=1 fault_injection=absent scenario=$SCENARIO_PATH"
+
+log "VALIDATOR_SELF_TESTS_START"
+run python3 "$ROOT/tools/cooja/codespaces/test_validate_simulation.py"
+
+run bash -c "cd '$COOJA' && CLASSPATH=/usr/share/java/jaxb-api.jar ant -Dbuild=build-codespaces -Dbuild.sysclasspath=last jar_cooja"
+[[ -r "$COOJA/dist/cooja.jar" && -d "$COOJA_BUILD" ]] || fail "Cooja core build outputs are missing"
+
+cat > "$CONFIG" <<EOF
+PATH_CONTIKI=$ROOT
+DEFAULT_PROJECTDIRS=
+COMPILER_ARGS=-I'\$(JAVA_HOME)/include' -I'\$(JAVA_HOME)/include/linux' -fno-builtin-printf -fPIC
+EOF
+log "EXTERNAL_TOOLS_CONFIG=$CONFIG"
+
+EXAMPLE="$ROOT/examples/ipv6/rpl-udp-dsme"
+mkdir -p "$EXAMPLE/obj_cooja"
+NATIVE_FLAGS="-fPIC -I$JAVA_HOME/include -I$JAVA_HOME/include/linux"
+LINK_COMMAND="gcc -I$JAVA_HOME/include -I$JAVA_HOME/include/linux -shared -Wl,-Map=obj_cooja/mtype154.map -o obj_cooja/mtype154.cooja"
+MO=5
+if [[ "$MODE" == fixed-mo6 ]]; then MO=6; fi
+BUILD_DEFS="TARGET=cooja DSME=1 PAN_COORDINATOR=1 DSME_CAP_REDUCTION=1 DSME_MO=$MO CONTIKI_APP=node"
+if [[ "$MODE" == adaptive ]]; then BUILD_DEFS="${BUILD_DEFS//DSME_MO=$MO/DSME_MO=5}"; BUILD_DEFS+=" ADAPTIVE_MO_DEMO=1 ADAPTIVE_MO_MIN=5 ADAPTIVE_MO_MAX=6 ADAPTIVE_MO_PHASE_SECONDS=30 ADAPTIVE_MO_DEMAND_MS=400 ADAPTIVE_MO_DEMAND_SLOTS=1"; else BUILD_DEFS+=" ADAPTIVE_MO_DEMO=1 ADAPTIVE_MO_MIN=5 ADAPTIVE_MO_MAX=6 ADAPTIVE_MO_PHASE_SECONDS=30 ADAPTIVE_MO_DEMAND_MS=400 ADAPTIVE_MO_DEMAND_SLOTS=1 DSME_FINAL_STATE_SNAPSHOT_SECONDS=298 DSME_ADAPTIVE_MO_ENABLE=0 DSME_ADAPTIVE_MO_MIN=5 DSME_ADAPTIVE_MO_MAX=6"; fi
+cat > "$RUN_CONFIGURATION" <<EOF
+mode=$MODE
+scenario=$SCENARIO_PATH
+seed=123456
+simulation_duration_us=$DURATION_US
+motes=3
+initial_mo=$INITIAL_MO
+minimum_mo=5
+maximum_mo=6
+superframe_order=4
+beacon_order=7
+radio=UDGM;tx_range_m=50;interference_range_m=50;bitrate_kbps=250;success_ratio_tx=1;success_ratio_rx=1
+traffic=common 30-second low/high phases;gts_demand_interval_ms=400;gts_demand_slots=1
+measurement_window_us=0..290000000
+drain_interval_us=10000000
+high_deadline_ms=0
+low_deadline_ms=0
+adaptive_controller=$([[ "$MODE" == adaptive ]] && echo enabled || echo disabled)
+build_definitions=$BUILD_DEFS
+EOF
+log "RUN_CONFIGURATION=$RUN_CONFIGURATION"
+log "NATIVE_BUILD_DEFINITIONS $BUILD_DEFS FAULT_INJECTION=absent"
+log "+ make -C $EXAMPLE -B -o obj_cooja $BUILD_DEFS LIBNAME=mtype154 SYMBOLS=1 JNI=$JAVA_HOME LINK_COMMAND_1='$LINK_COMMAND' LINK_COMMAND_2='-lstdc++ -lm' node.cooja"
+if make -C "$EXAMPLE" -B -o obj_cooja $BUILD_DEFS LIBNAME=mtype154 SYMBOLS=1 OBJCOPY=objcopy EXTRA_CC_ARGS="$NATIVE_FLAGS" LINK_COMMAND_1="$LINK_COMMAND" 'LINK_COMMAND_2=-lstdc++ -lm' node.cooja > "$NATIVE_LOG" 2>&1; then
+  tail -n 24 "$NATIVE_LOG" | tee -a "$LOG"
+else
+  tail -n 80 "$NATIVE_LOG" | tee -a "$LOG"
+  fail "native firmware build failed; full output: $NATIVE_LOG"
+fi
+log "NATIVE_BUILD_LOG=$NATIVE_LOG"
+
+LIB="$EXAMPLE/obj_cooja/mtype154.cooja"
+ARCHIVE="$EXAMPLE/obj_cooja/mtype154.a"
+MAINOBJ="$EXAMPLE/obj_cooja/mtype154.o"
+MAP="$EXAMPLE/obj_cooja/mtype154.map"
+for artifact in "$LIB" "$ARCHIVE" "$MAINOBJ" "$MAP"; do [[ -r "$artifact" ]] || fail "native build artifact missing: $artifact"; done
+REQUIRED_SYMBOLS=(simLoggedLength simLoggedFlag simLoggedData simOutSize simOutDataBuffer simInSize simInDataBuffer simRadioHWOn simSerialReceivingLength simSerialReceivingData)
+for symbol in "${REQUIRED_SYMBOLS[@]}"; do
+  nm -a "$ARCHIVE" | grep -Eq "[[:space:]]${symbol}$" || fail "symbol absent from archive: $symbol"
+  nm -D --defined-only "$LIB" | grep -Eq "[[:space:]]${symbol}$" || fail "symbol not exported from final shared library: $symbol"
+  grep -Fq "$symbol" "$MAP" || fail "symbol absent from linker map: $symbol"
+  grep -Fq "\"$symbol\"" "$EXAMPLE/symbols.c" || fail "symbol absent from generated table: $symbol"
+  log "SYMBOL_OK name=$symbol archive=$(nm -A "$ARCHIVE" | awk -v s="$symbol" '$NF == s {print $(NF-1); exit}') dynamic=$(nm -D "$LIB" | awk -v s="$symbol" '$NF == s {print $1; exit}')"
+done
+log "NATIVE_ELF $(readelf -h "$LIB" | awk -F: '/Class:|Machine:/{gsub(/^[ \t]+/,"",$2); printf "%s=%s ",$1,$2} END{print ""}')"
+
+CP="$COOJA_BUILD:$COOJA/dist/lib/log4j.jar:$COOJA/dist/lib/jdom.jar:$COOJA/dist/lib/jsyntaxpane.jar:$COOJA/dist/lib/swingx-all-1.6.4.jar:/usr/share/java/rhino.jar:/usr/share/java/jaxb-api.jar:/usr/share/java/jaxb-runtime.jar:/usr/share/java/jaxb-core.jar:/usr/share/java/javax.activation.jar"
+run javac -cp "$CP" -d "$COOJA_BUILD" "$COOJA/codespaces/GTSFinalRunner.java"
+VALIDATOR="$COOJA/codespaces/validate_simulation.py"
+[[ -r "$VALIDATOR" ]] || fail "simulation log validator is missing"
+log "COOJA_START scenario=$SCENARIO_PATH seed=123456 duration_us=$DURATION_US java_mode=-Xint"
+run java -Xint -Djava.awt.headless=true -cp "$CP" GTSFinalRunner "$SCENARIO_PATH" "$CONFIG" "$DURATION_US"
+
+log "VALIDATOR_START mode=$MODE log=$LOG report=$REPORT"
+if python3 "$VALIDATOR" --mode "$MODE" --log "$LOG" --scenario "$SCENARIO_PATH" --report "$REPORT" 2>&1 | tee -a "$LOG"; then
+  :
+else
+  local_status=${PIPESTATUS[0]}
+  fail "log validation failed exit=$local_status; see $REPORT"
+fi
+grep -q "^VALIDATION_PASS mode=$MODE " "$REPORT" || fail "validator did not produce a PASS report"
+log "SIMULATION_PASS mode=$MODE log=$LOG validation=$REPORT"
